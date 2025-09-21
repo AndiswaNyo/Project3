@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+pandas
+matplotlib
+openpyxl
+
+openai>=1.40.0
+python-dotenv>=1.0.1

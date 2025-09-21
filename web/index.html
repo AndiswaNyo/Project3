@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>KPI Chatbot</title>
+<style>
+  :root{
+    --bg:#f2f8ff;
+    --panel:#ffffff;
+    --primary:#4da3ff;
+    --primary-600:#2d8cf0;
+    --ink:#0f1b2d;
+    --muted:#5b6b80;
+    --bot:#e8f2ff;
+    --user:#d6f2ff;
+    --ok:#2da44e;
+    --err:#ff4d4f;
+    --chip:#e6f0ff;
+    --border:#dbe9ff;
+    --shadow: 0 8px 24px rgba(77,163,255,0.18);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;
+    font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,'Helvetica Neue',Arial;
+    color:var(--ink);
+    background: linear-gradient(180deg, #eaf4ff 0%, var(--bg) 100%);
+  }
+  .app{
+    display:grid;
+    grid-template-rows:auto 1fr auto;
+    height:100%;
+    max-width:1100px;
+    margin:0 auto;
+    gap:12px;
+    padding:16px;
+  }
+  header{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:18px;
+    box-shadow:var(--shadow);
+    padding:12px 16px;
+    display:flex;align-items:center;justify-content:space-between;gap:12px;
+  }
+  .brand{display:flex;align-items:center;gap:12px;}
+  .logo{
+    width:36px;height:36px;border-radius:12px;
+    background: radial-gradient(120% 120% at 30% 30%, #9fd0ff 0%, #57abff 45%, #2f7ae5 100%);
+    box-shadow: inset 0 0 10px rgba(255,255,255,0.35);
+  }
+  h1{font-size:18px;margin:0}
+  .sub{display:none}
+  .connect{display:none}
+
+  .btn{
+    background:var(--primary);
+    color:#fff;border:0;border-radius:12px;padding:10px 14px;
+    cursor:pointer;font-weight:600;
+    box-shadow:0 4px 14px rgba(45,140,240,0.25);
+  }
+  .btn:hover{background:var(--primary-600)}
+  .btn.secondary{
+    background:#eef6ff;color:#0a58ca;border:1px solid var(--border);box-shadow:none;
+  }
+
+  main{ display:grid;grid-template-columns:260px 1fr;gap:12px;min-height:0; }
+  @media (max-width:900px){ main{grid-template-columns:1fr} .side{order:2} }
+  .side{
+    background:var(--panel);border:1px solid var(--border);border-radius:18px;box-shadow:var(--shadow);
+    padding:14px; overflow:auto;
+  }
+  .chip{
+    display:inline-flex;align-items:center;gap:8px;
+    background:var(--chip);
+    padding:8px 10px;border-radius:999px;margin:6px 4px 0 0;cursor:pointer;border:1px solid var(--border);
+    font-size:13px;
+  }
+  .chip:hover{filter:brightness(0.98)}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px}
+  .chat{
+    display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--border);
+    border-radius:18px;box-shadow:var(--shadow);padding:12px;min-height:0;overflow:auto;
+  }
+  .msg{max-width:780px;margin:10px 0;display:flex;gap:10px}
+  .msg.user{margin-left:auto;flex-direction:row-reverse}
+  .bubble{
+    padding:12px 14px;border-radius:16px;border:1px solid var(--border);
+    background:var(--bot);
+    line-height:1.45;box-shadow:0 2px 10px rgba(0,0,0,0.05);
+  }
+  .user .bubble{background:var(--user)}
+  .meta{font-size:12px;color:var(--muted);margin-top:6px}
+  .badge{display:inline-block;padding:3px 8px;border-radius:999px;border:1px solid var(--border);background:#f5faff;margin-left:6px;font-size:11px}
+  .imgbox{
+    margin-top:8px;border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#fff;
+  }
+  .metric{
+    display:inline-flex;align-items:baseline;gap:10px;padding:10px 12px;border-radius:12px;background:#f5fbff;border:1px solid var(--border);
+    margin-top:8px
+  }
+  .metric .v{font-size:22px;font-weight:700}
+  footer{
+    background:var(--panel);border:1px solid var(--border);border-radius:18px;box-shadow:var(--shadow);
+    padding:10px;display:flex;gap:10px;align-items:center;position:sticky;bottom:0;
+  }
+  textarea{
+    flex:1;border:1px solid var(--border);border-radius:12px;padding:12px;resize:none;min-height:42px;max-height:120px;outline:none;
+  }
+  .small{font-size:11px;color:var(--muted)}
+  .sep{height:1px;background:var(--border);margin:10px 0}
+  .sr-only{position:absolute;left:-10000px;top:auto;width:1px;height:1px;overflow:hidden;}
+
+  .status .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:#cbd5e1}
+  .dot.ok{background:var(--ok)} .dot.err{background:var(--err)} .dot.idle{background:#cbd5e1}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">
+      <div class="logo" aria-hidden="true"></div>
+      <div>
+        <h1>KPI Chatbot</h1>
+        <div class="sub"></div>
+      </div>
+    </div>
+    <div class="connect">
+      <label for="base" class="sr-only">Base API URL</label>
+      <input id="base" type="url" />
+      <button class="btn" id="btnConnect" title="Connect">Connect</button>
+      <span class="status"><span class="dot idle" id="dot"></span><span id="statusText">Idle</span></span>
+    </div>
+  </header>
+
+  <main>
+    <aside class="side">
+      <strong>Quick asks</strong>
+      <div class="hint">Click to send a prompt</div>
+      <div style="margin-top:8px">
+        <button class="chip" data-q="dashboard">Dashboard</button>
+        <button class="chip" data-q="mttr month">MTTR by month</button>
+        <button class="chip" data-q="ticket volume month">Ticket volume / month</button>
+        <button class="chip" data-q="satisfaction_avg month line">Satisfaction trend</button>
+        <button class="chip" data-q="status mix by month">Status mix by month</button>
+        <button class="chip" data-q="top locations">Top locations</button>
+        <button class="chip" data-q="mttr month by asset line">MTTR by asset</button>
+        <button class="chip" data-q="satisfaction_avg by priority">Satisfaction by priority</button>
+        <button class="chip" data-q="ftfr">FTFR</button>
+        <div class="sep"></div>
+        <div class="small">Charts render from <code>/chart/{kpi}</code> and the grid at <code>/dashboard/chart</code>.</div>
+      </div>
+    </aside>
+
+    <section class="chat" id="chat" aria-live="polite">
+      <div class="msg">
+        <div class="bubble">
+          Ask me things like:
+          <ul>
+            <li>dashboard</li>
+            <li>mttr month</li>
+            <li>ticket volume by location</li>
+            <li>satisfaction_avg quarter line</li>
+            <li>status mix by month</li>
+          </ul>
+          I’ll detect the intent and show a chart or metric.
+          <div class="meta">Hints: “mttr month by asset line”, “top locations”, “ftfr”.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <textarea id="input" placeholder="Type your message… (e.g., ‘mttr month by asset line’)"></textarea>
+    <button class="btn" id="send">Send</button>
+    <button class="btn secondary" id="clear">Clear</button>
+  </footer>
+</div>
+
+<script>
+/* --- dynamic KPI + non-chart intents --- */
+let KPI_SET = new Set(['mttr','ticket_volume','satisfaction_avg','status_ratio','ftfr','top_locations']);
+const NON_CHART_INTENTS = new Set(['greeting','help','by_help','chat','goodbye']);
+
+
+// --- debug toggles ---
+const SHOW_DEBUG = false;
+const SHOW_META  = true;
+
+async function loadKpis(base){
+  try{
+    const r = await fetch(base.replace(/\/+$/,'') + '/categories');
+    const j = await r.json();
+    if (Array.isArray(j?.kpis)) KPI_SET = new Set(j.kpis);
+  }catch(_){}
+}
+
+(function(){
+  const DEFAULT_BASE = window.location.origin;
+
+  const el = {
+    base: document.getElementById('base'),
+    connect: document.getElementById('btnConnect'),
+    dot: document.getElementById('dot'),
+    status: document.getElementById('statusText'),
+    chat: document.getElementById('chat'),
+    input: document.getElementById('input'),
+    send: document.getElementById('send'),
+    clear: document.getElementById('clear'),
+  };
+
+  const savedBase = localStorage.getItem('kpi_base') || DEFAULT_BASE;
+  if (el.base) el.base.value = savedBase;
+
+  const setState = (ok, text) => {
+    if (el.dot) el.dot.className = 'dot ' + (ok === true ? 'ok' : ok === false ? 'err' : 'idle');
+    if (el.status) el.status.textContent = text || (ok === true ? 'Connected' : ok === false ? 'Error' : 'Idle');
+  };
+
+  const scrollBottom = ()=> el.chat.scrollTo({top: el.chat.scrollHeight, behavior:'smooth'});
+
+  function addMsg(role, html, extra){
+    const wrap = document.createElement('div');
+    wrap.className = 'msg' + (role==='user' ? ' user' : '');
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.innerHTML = html;
+    wrap.appendChild(bubble);
+
+    if(extra && extra.img){
+      const imgBox = document.createElement('div');
+      imgBox.className = 'imgbox';
+      const img = document.createElement('img');
+      img.alt = extra.alt || 'chart';
+      img.style.maxWidth = '100%';
+      img.loading = 'lazy';
+      img.src = extra.img;
+      imgBox.appendChild(img);
+      bubble.appendChild(imgBox);
+    }
+    if(extra && extra.metric){
+      const m = document.createElement('div');
+      m.className = 'metric';
+      m.innerHTML = `<span class="v">${extra.metric.value}</span><span>${extra.metric.label||''}</span>`;
+      bubble.appendChild(m);
+    }
+    el.chat.appendChild(wrap);
+    scrollBottom();
+  }
+
+  function sanitizeBase(u){ return (u || '').replace(/\/+$/,''); }
+
+  // Health check + load KPI list
+  async function ping(silent=true){
+    const base = sanitizeBase(el.base.value);
+    if(!base){ setState(false, 'Enter API URL'); return; }
+    setState(null, 'Checking…');
+    try{
+      const r = await fetch(base + '/health', {method:'GET'});
+      if(!r.ok) throw new Error(r.status + ' ' + r.statusText);
+      const data = await r.json();
+      if(!data || data.ok !== true) throw new Error('Unexpected /health response');
+
+      await loadKpis(base);
+
+      localStorage.setItem('kpi_base', base);
+      setState(true, 'Connected');
+    }catch(err){
+      console.error(err);
+      setState(false, 'Cannot reach server');
+      if(!silent){
+        addMsg('bot', `I couldn’t reach the backend. Is it running at <code>${base}</code>?`);
+      }
+    }
+  }
+
+  // Parse helpers prefer backend-parsed values, but we provide fallbacks
+  function parsePeriod(qLower){
+    if (/\bquarter\b/.test(qLower)) return 'quarter';
+    if (/\bweek\b/.test(qLower))    return 'week';
+    if (/\bbi[-\s]?weekly\b|\bfortnight\b|\b(?:2|two)\s*weeks?\b/.test(qLower)) return 'biweekly';
+    return 'month';
+  }
+  function parseBy(qLower){
+    if (/\bpriority\b/.test(qLower)) return 'priority';
+    if (/\basset\b/.test(qLower))    return 'asset';
+    if (/\blocation\b/.test(qLower)) return 'location';
+    if (/\bassignee\b/.test(qLower)) return 'assignee';
+    if (/\bstatus\b/.test(qLower))   return 'status';
+    return null;
+  }
+  function parseChart(qLower){
+    // normalize hyphens/underscores to spaces
+    const t = qLower.replace(/[_-]+/g, ' ');
+    if (/\b(line|line graph|line chart|lines)\b/.test(t)) return 'line';
+    if (/\b(pie|pie chart|piechart)\b/.test(t)) return 'pie';
+    if (/\b(bar|bar graph|bar chart|bars)\b/.test(t)) return 'bar';
+    return null;
+}
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, m => (
+      {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]
+    ));
+  }
+
+  async function send(){
+    const q = el.input.value.trim();
+    if(!q) return;
+
+    const base = sanitizeBase(el.base.value);
+    addMsg('user', escapeHtml(q));
+    el.input.value = '';
+
+    if(!base){
+      addMsg('bot', 'Backend URL missing.');
+      return;
+    }
+
+    try{
+      setState(null, 'Calling /chat…');
+      const r = await fetch(base + '/chat', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({message: q})
+      });
+      const data = await r.json().catch(()=> ({}));
+      if(!r.ok){
+        const msg = (data && (data.detail || data.message)) || (r.status + ' ' + r.statusText);
+        throw new Error(msg);
+      }
+
+      const intent  = data.intent;
+      const payload = data.payload;
+
+      if (NON_CHART_INTENTS.has(intent)) {
+        const msg = (payload && payload.reply) ? payload.reply : 'Okay.';
+        let html = `<div>${escapeHtml(msg).replace(/\n/g,'<br>')}</div>`;
+
+        if (payload && payload.quick) {
+          const qk  = payload.quick;
+          const k   = Array.isArray(qk.kpis)      ? qk.kpis.slice(0,6) : [];
+          const per = Array.isArray(qk.periods)   ? qk.periods         : [];
+          const bys = Array.isArray(qk.by_fields) ? qk.by_fields       : [];
+          const chips = []
+            .concat(k.map(x  => `<span class="chip" data-q="${x}">${x}</span>`))
+            .concat(per.map(x=> `<span class="chip" data-q="${x}">${x}</span>`))
+            .concat(bys.map(x => `<span class="chip" data-q="by ${x}">${x}</span>`))
+            .join(' ');
+          if (chips) html += `<div class="hint" style="margin-top:8px">Try:</div><div>${chips}</div>`;
+        }
+
+        addMsg('bot', html);
+        setState(true, 'Connected');
+        return;
+      }
+
+      const parsed = data?.parsed || {};
+      const qLower = q.toLowerCase();
+      const period = (parsed.period) ?? parsePeriod(qLower);
+      const by     = (parsed.by)     ?? parseBy(qLower);
+      const chart  = (parsed.chart)  ?? parseChart(qLower) ?? null;
+      const askedForTable = /\btable\b/.test(qLower);
+
+      const paramsKpi  = new URLSearchParams();
+      const paramsDash = new URLSearchParams();
+      if (period) { paramsKpi.set('period', period);  paramsDash.set('period', period); }
+      if (by)     { paramsKpi.set('by', by);          paramsDash.set('by', by); }
+      // Only pass chart when not asking for "table"
+      if (chart && !askedForTable) { paramsKpi.set('chart', chart); }
+
+      if(!intent){
+        addMsg('bot', (data.reply || 'I did not understand that query.') + ` <span class="badge">no-intent</span>`);
+        setState(true, 'Connected');
+        return;
+      }
+
+      let body = '';
+      if (SHOW_DEBUG) {
+        body = `<div class="meta"><strong>Intent:</strong> <code>${escapeHtml(intent)}</code>${
+          (payload && payload.type) ? ` · type: <code>${escapeHtml(payload.type)}</code>` : ''
+        }</div>`;
+      }
+
+      const kpiNames = Array.from(KPI_SET);
+
+      const metaLine = SHOW_META
+        ? `<div class="meta">period=${escapeHtml(period || '-')}${by ? `, by=${escapeHtml(by)}` : ''}</div>`
+        : '';
+
+      if (intent === 'dashboard') {
+        const dashImg = `${base}/dashboard/chart?${paramsDash.toString()}&t=${Date.now()}`;
+        try {
+          const rDash = await fetch(`${base}/dashboard?${paramsDash.toString()}`);
+          const jDash = await rDash.json();
+
+          const kpis = jDash?.kpis || {};
+
+          // Build summary lines:
+          // - skip any *_table helpers
+          // - de-dupe by title
+          // - Top Locations always lists exactly 5 cities (fallback to table index)
+          const normalizeTitle = (t) =>
+            String(t || '')
+              .trim()
+              .toLowerCase()
+              .replace(/\btop\s*\d*\s*locations(?:.*)?$/i, 'top locations');
+
+          const seenTitles = new Set();
+          let topLocationsShown = false;
+
+          const lines = Object.keys(kpis).reduce((acc, key) => {
+            const p = kpis[key];
+            if (!p) return acc;
+
+            if (key.endsWith('_table')) return acc;
+
+            const title = (p.title || key).trim();
+            const norm  = normalizeTitle(title);
+
+            // Only one Top Locations line
+            const isTop =
+              /top\s*\d*\s*locations/i.test(title) || key.startsWith('top_locations');
+            if (isTop) {
+              if (topLocationsShown) return acc;
+              const fallback = (kpis['top_locations_table']?.index || []);
+              const labels = (Array.isArray(p.labels) && p.labels.length ? p.labels : fallback).slice(0, 5);
+              acc.push(`- ${title}: ${labels.join(', ')}`);
+              topLocationsShown = true;
+              seenTitles.add(norm);
+              return acc;
+            }
+
+            // De-dupe by normalized title
+            if (seenTitles.has(norm)) return acc;
+
+            if (p.type === 'metric') {
+              const v = (typeof p.value === 'number') ? Number(p.value).toFixed(2) : p.value;
+              acc.push(`- ${title}: ${v}`);
+            } else if (p.type === 'bar') {
+              const labs = Array.isArray(p.labels) ? p.labels : [];
+              const sample = labs.length > 3 ? `${labs.slice(0,3).join(', ')} …` : labs.join(', ');
+              acc.push(`- ${title}: ${sample}`);
+            } else if (p.type === 'table') {
+              const idx = (p.index || []).map(x => Array.isArray(x) ? x.join(' · ') : x);
+              const sample = idx.length > 3 ? `${idx.slice(0,3).join(', ')} …` : idx.join(', ');
+              acc.push(`- ${title}: ${sample}`);
+            } else if (p.type === 'ratio') {
+              acc.push(`- ${title}: ratio data`);
+            } else {
+              acc.push(`- ${title}: data`);
+            }
+
+            seenTitles.add(norm);
+            return acc;
+          }, []).join('<br>');
+
+          addMsg(
+            'bot',
+            body + metaLine + `<div class="meta">Dashboard summary:</div><div class="small">${lines}</div>`,
+            { img: dashImg, alt: 'dashboard chart' }
+          );
+        } catch {
+          addMsg('bot', body + metaLine, { img: dashImg, alt: 'dashboard chart' });
+        }
+
+      } else if (kpiNames.includes(intent)) {
+      // Respect server's validated choice if provided; else user's request; else backend default
+      const chartParam = chart || (data && data.chart) || null;
+
+      const params = new URLSearchParams(paramsKpi);
+      // We only pass chart to /chart if it's not 'table' (tables are rendered inline)
+      if (chartParam && chartParam !== 'table') params.set('chart', chartParam);
+
+      // If the user asked for a table and the payload is table-shaped, render it inline
+      if (askedForTable && payload && payload.type === 'table') {
+        const idx  = (payload.index || []).map(x => Array.isArray(x) ? x.join(' · ') : x);
+        const vals = payload.values || [];
+        const rows = idx.map((l, i) =>
+          `<tr><td>${escapeHtml(String(l))}</td><td style="text-align:right">${escapeHtml(String(vals[i]))}</td></tr>`
+        ).join('');
+
+        // Friendly headers that match the chart axes (fallbacks if backend doesn’t send labels)
+        const idxLabel = payload.index_label || (
+          intent === 'mttr'                               ? 'Date' :
+          intent === 'ticket_volume'                      ? 'Date' :
+          intent === 'satisfaction_avg'                   ? 'Date' :
+          intent === 'ftfr'                               ? 'Date' :
+          (intent && intent.startsWith('top_locations'))  ? 'City' :
+          intent === 'status_ratio'                       ? 'Status' :
+          'Group'
+        );
+        const valLabel = payload.value_label || (
+          intent === 'mttr'                               ? 'Rate (min)' :
+          intent === 'ticket_volume'                      ? 'Number of tickets' :
+          intent === 'satisfaction_avg'                   ? 'Score (1–5)' :
+          intent === 'ftfr'                               ? 'Rate' :
+          (intent && intent.startsWith('top_locations'))  ? 'Number of tickets' :
+          intent === 'status_ratio'                       ? '%' :
+          'Value'
+        );
+
+        addMsg('bot', body + metaLine + `
+          <div class="meta">Table</div>
+          <div class="imgbox" style="overflow:auto">
+            <table style="width:100%;border-collapse:collapse">
+              <thead>
+                <tr>
+                  <th style="text-align:left">${escapeHtml(idxLabel)}</th>
+                  <th style="text-align:right">${escapeHtml(valLabel)}</th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        `);
+        setState(true, 'Connected');
+        return;
+      }
+
+      // Otherwise, render the chart image as usual
+      const imgUrl = `${base}/chart/${encodeURIComponent(intent)}?${params.toString()}&t=${Date.now()}`;
+
+      if (payload && payload.type === 'metric') {
+        const isFtfr = (payload.title||'').toLowerCase().includes('ftfr');
+        const v = (typeof payload.value === 'number')
+          ? (isFtfr ? (payload.value*100).toFixed(2)+'%' : (payload.value.toFixed ? payload.value.toFixed(2) : payload.value))
+          : payload.value;
+
+        addMsg('bot', body + metaLine, { metric:{ value: v, label: payload.title || '' } });
+        addMsg('bot', `<div class="meta">Chart</div>`, { img: imgUrl, alt: `${intent} chart` });
+      } else {
+        addMsg('bot', body + metaLine, { img: imgUrl, alt: `${intent} chart` });
+      }
+
+      } else if (payload && payload.type === 'metric') {
+        const isFtfr = (payload.title||'').toLowerCase().includes('ftfr');
+        const v = (typeof payload.value === 'number')
+          ? (isFtfr ? (payload.value*100).toFixed(2)+'%' : (payload.value.toFixed ? payload.value.toFixed(2) : payload.value))
+          : payload.value;
+        addMsg('bot', body, { metric:{ value: v, label: payload.title || '' } });
+
+      } else if (payload && payload.type === 'error') {
+        addMsg('bot', body + `<div class="meta" style="color:var(--err)">Error: ${payload.message||'Unknown error'}</div>`);
+
+      } else {
+        addMsg('bot', body + `<pre style="white-space:pre-wrap;background:#f7fbff;border:1px solid var(--border);border-radius:10px;padding:8px;margin-top:8px;">${escapeHtml(JSON.stringify(payload ?? {}, null, 2)).slice(0,1200)}</pre>`);
+      }
+
+      setState(true, 'Connected');
+    } catch(err) {
+      console.error(err);
+      addMsg('bot', `Request failed: <span style="color:var(--err)">${escapeHtml(err.message||String(err))}</span>`);
+      setState(false, 'Request error');
+    }
+  }
+
+  el.connect && el.connect.addEventListener('click', () => ping(true));
+  el.send.addEventListener('click', send);
+  el.clear.addEventListener('click', ()=> { el.chat.innerHTML=''; });
+  el.input.addEventListener('keydown', (e)=> {
+    if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }
+  });
+
+  document.querySelectorAll('.chip').forEach(ch => ch.addEventListener('click', () => {
+    el.input.value = ch.getAttribute('data-q');
+    el.input.focus();
+  }));
+  el.chat.addEventListener('click', (e) => {
+    const chip = e.target.closest('.chip');
+    if (!chip) return;
+    el.input.value = chip.getAttribute('data-q') || '';
+    el.input.focus();
+  });
+
+  setTimeout(() => ping(true), 100);
+})();
+</script>
+</body>
+</html>

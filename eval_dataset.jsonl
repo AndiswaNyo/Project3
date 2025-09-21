@@ -1,0 +1,25 @@
+﻿@'
+{"text":"mttr month by asset line","gold":{"name":"mttr","period":"month","by":"asset","chart":"line"}}
+{"text":"mean time to repair by asset for this month","gold":{"name":"mttr","period":"month","by":"asset","chart":"line"}}
+{"text":"repair time by asset monthly trend","gold":{"name":"mttr","period":"month","by":"asset","chart":"line"}}
+
+{"text":"ticket volume by location bar","gold":{"name":"ticket_volume","period":null,"by":"location","chart":"bar"}}
+{"text":"how many tickets per site","gold":{"name":"ticket_volume","period":null,"by":"location","chart":null}}
+{"text":"ticket counts by branch pie","gold":{"name":"ticket_volume","period":null,"by":"location","chart":"pie"}}
+
+{"text":"status mix by month","gold":{"name":"status_ratio","period":"month","by":null,"chart":null}}
+{"text":"tickets by status percent this month","gold":{"name":"status_ratio","period":"month","by":null,"chart":"pie"}}
+{"text":"monthly status distribution","gold":{"name":"status_ratio","period":"month","by":null,"chart":null}}
+
+{"text":"top locations","gold":{"name":"top_locations","period":null,"by":null,"chart":null}}
+{"text":"top 10 sites by tickets","gold":{"name":"top_locations","period":null,"by":null,"chart":"bar"}}
+{"text":"most active branches","gold":{"name":"top_locations","period":null,"by":null,"chart":null}}
+
+{"text":"satisfaction_avg quarter line","gold":{"name":"satisfaction_avg","period":"quarter","by":null,"chart":"line"}}
+{"text":"average satisfaction by month line","gold":{"name":"satisfaction_avg","period":"month","by":null,"chart":"line"}}
+{"text":"csat monthly trend","gold":{"name":"satisfaction_avg","period":"month","by":null,"chart":"line"}}
+
+{"text":"ftfr month","gold":{"name":"ftfr","period":"month","by":null,"chart":null}}
+{"text":"first time fix rate by asset","gold":{"name":"ftfr","period":null,"by":"asset","chart":"bar"}}
+{"text":"first-time fix percentage monthly","gold":{"name":"ftfr","period":"month","by":null,"chart":"line"}}
+'@ | Set-Content .\eval_dataset.jsonl

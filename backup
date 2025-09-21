@@ -1,0 +1,536 @@
+"""
+KPI Chatbot backend (FastAPI) for your HTML front-end.
+
+Run locally:
+  pip install -r requirements.txt
+  uvicorn app:app --reload
+
+In your HTML 'Connect' box paste:
+  http://localhost:8000
+"""
+
+# ----------------------------- Standard libs ------------------------------
+from pathlib import Path
+from io import BytesIO
+import re
+from typing import Optional, List
+import calendar  # <-- for robust handling of month names / numbers
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pandas as pd
+import numpy as np
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
+
+# =============================== Configuration ============================
+EXCEL_PATH = Path("Realistic_Ticket_Data_Updated.xlsx")   # adjust if needed
+TITLE = "KPI Chatbot (Local FastAPI)"
+
+# Cache for the loaded/processed DataFrame (avoid re-reading on every call)
+_df_cache: Optional[pd.DataFrame] = None
+
+
+# ============================== Data Utilities ============================
+def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize column names to snake_case lowercase and strip odd symbols.
+    This makes subsequent column lookups robust across different files.
+    """
+    df = df.copy()
+    df.columns = (
+        pd.Index(df.columns)
+        .astype(str)
+        .str.strip()
+        .str.replace(r"\s+", "_", regex=True)
+        .str.replace(r"[^0-9a-zA-Z_]+", "", regex=True)
+        .str.lower()
+    )
+    return df
+
+
+def _first(df: pd.DataFrame, *names: str) -> Optional[str]:
+    """
+    Return the first existing column name from the provided candidates.
+    Helpful when dataset headers vary slightly across files.
+    """
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+
+def _prepare_df() -> pd.DataFrame:
+    """
+    Read Excel → normalize columns → derive features (month, mttr, sat, returned_flag).
+    Stores likely column picks in df.attrs for later reuse.
+    """
+    if not EXCEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Excel not found: {EXCEL_PATH.resolve()} "
+            f"(put your file next to app.py or change EXCEL_PATH)."
+        )
+
+    df = pd.read_excel(EXCEL_PATH)
+    df = _clean_columns(df)
+
+    # Try to resolve common field names across possible schemas
+    col_created = _first(df, "created_on", "created_at", "ticket_creation_date",
+                         "ticket_created_on", "created", "date")
+    col_start   = _first(df, "start_of_the_uptime", "start_of_uptime", "start_time", "start")
+    col_final   = _first(df, "final_commissioning_date", "final_commissioning",
+                         "resolved_on", "closed_on", "end_time", "end")
+    col_status  = _first(df, "status", "ticket_status")
+    col_loc     = _first(df, "location", "site", "branch")
+    col_asset   = _first(df, "asset_name", "asset", "machine", "equipment")
+    col_priority= _first(df, "priority", "ticket_priority")
+    col_sat_in  = _first(df, "sat", "satisfaction_score", "csat",
+                         "customer_satisfaction", "customer_satisfaction_score")
+    col_return  = _first(df, "is_returned_ticket", "returned_ticket", "is_repeat",
+                         "repeat_ticket", "returned_flag")
+
+    # Parse dates where present
+    for c in [col_created, col_start, col_final]:
+        if c:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+
+    # MTTR in minutes if we can compute it
+    if col_start and col_final:
+        df["mttr"] = (df[col_final] - df[col_start]).dt.total_seconds() / 60.0
+
+    # Month bucket (string "YYYY-MM"); create only if not already present
+    if "month" not in df.columns and col_created:
+        df["month"] = df[col_created].dt.to_period("M").astype("string")
+
+    # Satisfaction: accept 1–5 or 0–100 (normalize to 1–5)
+    def _sat(x):
+        try:
+            v = float(x)
+            if 1 <= v <= 5:
+                return v
+            if 0 <= v <= 100:
+                return 1 + 4 * (v / 100.0)
+        except Exception:
+            return None
+    if col_sat_in:
+        df["sat"] = df["sat"].map(_sat) if "sat" in df.columns else df[col_sat_in].map(_sat)
+
+    # Returned flag: 1 = returned/repeat, 0 = first-time fix
+    if col_return and "returned_flag" not in df.columns:
+        mapping = {
+            "yes": 1, "y": 1, "true": 1, "1": 1, "repeat": 1, "returned": 1,
+            "no": 0, "n": 0, "false": 0, "0": 0, "first time": 0,
+            "first-time": 0, "firsttime": 0
+        }
+        df["returned_flag"] = pd.to_numeric(
+            df[col_return].astype(str).str.lower().map(mapping), errors="coerce"
+        )
+
+    # Stash the resolved columns for later helpers
+    df.attrs["col_status"]   = col_status
+    df.attrs["col_loc"]      = col_loc
+    df.attrs["col_asset"]    = col_asset
+    df.attrs["col_priority"] = col_priority
+    return df
+
+
+def get_df() -> pd.DataFrame:
+    """
+    Lazy-load and cache the prepared DataFrame.
+    """
+    global _df_cache
+    if _df_cache is None:
+        _df_cache = _prepare_df()
+    return _df_cache
+
+
+# =========================== Month Index Utilities =========================
+def _infer_month_style(labels: List[str]) -> str:
+    """
+    Detect how months are labeled:
+      - 'ym'   : 'YYYY-MM' (e.g., '2025-08')
+      - 'num'  : numeric 1..12 (int or string)
+      - 'name' : month names/abbrev (Jan/January)
+      - 'other': unknown
+    """
+    labs = [str(l) for l in labels if l is not None]
+    if labs and all(re.fullmatch(r"\d{4}-\d{2}", s) for s in labs):
+        return "ym"
+    if labs and all(re.fullmatch(r"\d{1,2}", s) and 1 <= int(s) <= 12 for s in labs):
+        return "num"
+    abbr = {m.lower() for m in calendar.month_abbr if m}
+    full = {m.lower() for m in calendar.month_name if m}
+    if labs and all(s.lower() in abbr or s.lower() in full for s in labs):
+        return "name"
+    return "other"
+
+
+def _sort_and_fill_month_series(s: pd.Series, for_counts: bool):
+    """
+    Sort month-indexed series chronologically and ensure all months appear.
+
+    - If labels are 'YYYY-MM', we extend from min..max with monthly frequency.
+    - If labels are 1..12 or 'Jan'..'Dec', we reindex to a fixed Jan..Dec slate.
+    - For counts, missing months are filled with 0; for means, left as NaN.
+
+    Returns:
+        x (List[str]): labels for the x-axis
+        y (List[float]): values aligned with x
+    """
+    style = _infer_month_style(list(s.index))
+
+    if style == "ym":
+        # Use PeriodIndex to sort; include the full monthly range.
+        idx = pd.PeriodIndex(s.index, freq="M")
+        s = pd.Series(s.values, index=idx).sort_index()
+        full = pd.period_range(idx.min(), idx.max(), freq="M")
+        s = s.reindex(full, fill_value=(0 if for_counts else np.nan))
+        x = full.astype(str).tolist()
+        y = [float(v) if pd.notna(v) else float("nan") for v in s.values]
+        return x, y
+
+    if style in {"num", "name"}:
+        # Map names→numbers or keep numbers 1..12, then reindex to 1..12.
+        if style == "num":
+            nums = [int(str(l)) for l in s.index]
+        else:
+            m2n = {calendar.month_abbr[i].lower(): i for i in range(1, 13)}
+            m2n.update({calendar.month_name[i].lower(): i for i in range(1, 13)})
+            nums = [m2n[str(l).lower()] for l in s.index]
+        snum = pd.Series(s.values, index=nums).groupby(level=0).mean()
+        snum = snum.reindex(range(1, 13), fill_value=(0 if for_counts else np.nan))
+        x = [calendar.month_abbr[i] for i in range(1, 13)]        # 'Jan'..'Dec'
+        y = [float(v) if pd.notna(v) else float("nan") for v in snum.values]
+        return x, y
+
+    # Fallback: just sort by label as strings
+    s = s.sort_index()
+    x = [str(k) for k in s.index]
+    y = [float(v) if pd.notna(v) else float("nan") for v in s.values]
+    return x, y
+
+
+# ============================== Chart Utilities ===========================
+def _png(fig) -> bytes:
+    """
+    Render the Matplotlib figure to PNG bytes and close it.
+    """
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def series_png(x: List[str], y: List[float], title: str, xlabel: str, ylabel: str) -> bytes:
+    """
+    Line chart with:
+      - vertical (90°) x-axis labels so months are fully readable
+      - dynamic figure width so all labels fit without clipping
+    """
+    n = max(1, len(x))
+    width = max(8, min(30, 0.65 * n))  # widen for many labels, cap at 30"
+    fig, ax = plt.subplots(figsize=(width, 5))
+    ax.plot(x, y, marker="o")
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.tick_params(axis="x", labelrotation=90)   # vertical labels
+    ax.margins(x=0.01)
+    fig.subplots_adjust(bottom=0.35)             # extra room for tall labels
+    return _png(fig)
+
+
+def bar_png(labels: List[str], values: List[float], title: str,
+            xlabel: str = "Category", ylabel: str = "Value") -> bytes:
+    """
+    Bar chart with vertical x-labels and dynamic width (for long/ many names).
+    """
+    n = max(1, len(labels))
+    width = max(8, min(30, 0.65 * n))
+    fig, ax = plt.subplots(figsize=(width, 5))
+    ax.bar(labels, values)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.tick_params(axis="x", labelrotation=90)
+    ax.margins(x=0.01)
+    fig.subplots_adjust(bottom=0.35)
+    return _png(fig)
+
+
+# ================================ KPI Logic ===============================
+def mttr_by_month():
+    """
+    Average MTTR per month (minutes).
+    Handles months labeled as 'YYYY-MM', 1..12, or names (Jan/January).
+    Includes all months (gaps = NaN) and sorts chronologically.
+    """
+    d = get_df()
+    if "mttr" not in d.columns or "month" not in d.columns:
+        return {"type": "error", "message": "MTTR or month not available."}
+    s = d.groupby("month")["mttr"].mean(numeric_only=True)
+    x, y = _sort_and_fill_month_series(s, for_counts=False)
+    return {"type": "series", "title": "MTTR by Month", "x": x, "y": y}
+
+
+def tickets_by_month():
+    """
+    Ticket volume per month (counts).
+    Handles 'YYYY-MM', 1..12, or month names. Missing months → 0.
+    """
+    d = get_df()
+    if "month" not in d.columns:
+        return {"type": "error", "message": "month not available."}
+    s = d.groupby("month").size()
+    x, y = _sort_and_fill_month_series(s, for_counts=True)
+    return {"type": "series", "title": "Ticket Volume per Month", "x": x, "y": [int(v) for v in y]}
+
+
+def satisfaction_trend():
+    """
+    Average satisfaction per month (normalized to ~1–5).
+    Handles 'YYYY-MM', 1..12, or month names. Missing months kept as NaN.
+    """
+    d = get_df()
+    if "sat" not in d.columns or "month" not in d.columns:
+        return {"type": "error", "message": "month or satisfaction not available."}
+    s = pd.to_numeric(d["sat"], errors="coerce").groupby(d["month"]).mean()
+    x, y = _sort_and_fill_month_series(s, for_counts=False)
+    return {"type": "series", "title": "Satisfaction Trend", "x": x, "y": y}
+
+
+def status_distribution():
+    """
+    Overall distribution of ticket status values (bar chart).
+    """
+    d = get_df()
+    col = d.attrs.get("col_status") or ("status" if "status" in d.columns else None)
+    if not col:
+        return {"type": "error", "message": "status column not available."}
+    s = d[col].value_counts()
+    return {"type": "bar", "title": "Ticket Status Distribution",
+            "labels": s.index.astype(str).tolist(), "values": [int(v) for v in s.values]}
+
+
+def top_locations():
+    """
+    Top 10 locations by ticket count (bar chart).
+    """
+    d = get_df()
+    col = d.attrs.get("col_loc") or next((c for c in ["location", "site", "branch"] if c in d.columns), None)
+    if not col:
+        return {"type": "error", "message": "location column not available."}
+    s = d[col].value_counts().head(10)
+    return {"type": "bar", "title": "Top Locations by Tickets",
+            "labels": s.index.astype(str).tolist(), "values": [int(v) for v in s.values]}
+
+
+def mttr_by_asset():
+    """
+    Average MTTR per asset (top 10, descending).
+    """
+    d = get_df()
+    if "mttr" not in d.columns:
+        return {"type": "error", "message": "mttr not available."}
+    col = d.attrs.get("col_asset") or next((c for c in ["asset_name", "asset", "machine", "equipment"] if c in d.columns), None)
+    if not col:
+        return {"type": "error", "message": "asset column not available."}
+    s = d.groupby(col)["mttr"].mean(numeric_only=True).dropna().sort_values(ascending=False).head(10)
+    return {"type": "bar", "title": "Top Assets by MTTR",
+            "labels": s.index.astype(str).tolist(), "values": [float(v) for v in s.values]}
+
+
+def avg_satisfaction():
+    """
+    Single metric: overall average satisfaction (1–5).
+    """
+    d = get_df()
+    if "sat" not in d.columns:
+        return {"type": "error", "message": "satisfaction column not available."}
+    val = float(pd.to_numeric(d["sat"], errors="coerce").mean())
+    return {"type": "metric", "title": "Average Satisfaction", "value": val}
+
+
+def satisfaction_by_priority():
+    """
+    Average satisfaction by ticket priority (bar chart).
+    """
+    d = get_df()
+    if "sat" not in d.columns:
+        return {"type": "error", "message": "satisfaction column not available."}
+    col = d.attrs.get("col_priority") or next((c for c in ["priority", "ticket_priority"] if c in d.columns), None)
+    if not col:
+        return {"type": "error", "message": "priority column not available."}
+    s = pd.to_numeric(d["sat"], errors="coerce").groupby(d[col]).mean().dropna()
+    return {"type": "bar", "title": "Satisfaction by Priority",
+            "labels": s.index.astype(str).tolist(), "values": [float(v) for v in s.values]}
+
+
+def satisfaction_by_asset():
+    """
+    Average satisfaction by asset (top 10, descending).
+    """
+    d = get_df()
+    if "sat" not in d.columns:
+        return {"type": "error", "message": "satisfaction column not available."}
+    col = d.attrs.get("col_asset") or next((c for c in ["asset_name", "asset", "machine", "equipment"] if c in d.columns), None)
+    if not col:
+        return {"type": "error", "message": "asset column not available."}
+    s = pd.to_numeric(d["sat"], errors="coerce").groupby(d[col]).mean().dropna().sort_values(ascending=False).head(10)
+    return {"type": "bar", "title": "Satisfaction by Asset",
+            "labels": s.index.astype(str).tolist(), "values": [float(v) for v in s.values]}
+
+
+def ftfr():
+    """
+    First Time Fix Rate (1 - mean(returned_flag)).
+    """
+    d = get_df()
+    if "returned_flag" not in d.columns:
+        return {"type": "error", "message": "returned_flag column not available."}
+    v = pd.to_numeric(d["returned_flag"], errors="coerce").dropna()
+    if v.empty:
+        return {"type": "error", "message": "returned_flag has no numeric values."}
+    return {"type": "metric", "title": "First Time Fix Rate (FTFR)", "value": float(1.0 - v.mean())}
+
+
+# ============================== Intent Detection ==========================
+INTENTS = {
+    "mttr_month": [r"\bmttr\b.*\bmonth", r"\bmonth\b.*\bmttr\b"],
+    "tickets_month": [r"\bticket(s)?\b.*\bmonth", r"\bmonth\b.*\bticket"],
+    "satisfaction_trend": [r"\bsatisfaction\b.*\btrend"],
+    "status_dist": [r"\bstatus\b.*\b(distribution|breakdown|split|stacked|mix)"],
+    "top_locations": [r"\btop\b.*\blocation", r"\blocation(s)?\b.*\btop"],
+    "mttr_by_asset": [r"\bmttr\b.*\basset", r"\basset\b.*\bmttr\b"],
+    "avg_satisfaction": [r"\bavg(erage)?\b.*\bsatisfaction"],
+    "satisfaction_by_priority": [r"\bsatisfaction\b.*\bpriority"],
+    "satisfaction_by_asset": [r"\bsatisfaction\b.*\basset"],
+    "ftfr": [r"\bftfr\b", r"first\s*time\s*fix"],
+}
+
+def predict_intent(msg: str) -> Optional[str]:
+    """
+    Lightweight rule-based intent detector to route the user's query.
+    """
+    m = (msg or "").lower().strip()
+    for intent, pats in INTENTS.items():
+        if any(re.search(p, m) for p in pats):
+            return intent
+    if "mttr" in m:
+        return "mttr_month"
+    if "ticket" in m and "month" in m:
+        return "tickets_month"
+    return None
+
+
+# ================================ FastAPI =================================
+class ChatIn(BaseModel):
+    message: str
+
+
+app = FastAPI(title=TITLE)
+
+# CORS so your browser can call from file:// or Live Server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+def health():
+    """
+    Simple readiness check. Also exercises data loading so you see
+    a clear error if the Excel path is wrong.
+    """
+    try:
+        _ = get_df()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/chat")
+def chat(inp: ChatIn):
+    """
+    Intent endpoint used by the front-end. Returns:
+      - detected intent
+      - a lightweight payload describing the result (series/bar/metric)
+    """
+    intent = predict_intent(inp.message)
+    if not intent:
+        return JSONResponse({
+            "intent": None,
+            "reply": "Try: 'mttr month', 'tickets month', 'satisfaction trend', 'status stacked', 'ftfr'."
+        })
+
+    try:
+        payload = (
+            mttr_by_month()                if intent == "mttr_month" else
+            tickets_by_month()             if intent == "tickets_month" else
+            satisfaction_trend()           if intent == "satisfaction_trend" else
+            status_distribution()          if intent == "status_dist" else
+            top_locations()                if intent == "top_locations" else
+            mttr_by_asset()                if intent == "mttr_by_asset" else
+            avg_satisfaction()             if intent == "avg_satisfaction" else
+            satisfaction_by_priority()     if intent == "satisfaction_by_priority" else
+            satisfaction_by_asset()        if intent == "satisfaction_by_asset" else
+            ftfr()                         if intent == "ftfr" else
+            {"type": "error", "message": "Unhandled intent."}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return JSONResponse({"intent": intent, "payload": payload})
+
+
+@app.get("/chart/{intent}")
+def chart(intent: str):
+    """
+    Image endpoint. The front-end embeds the returned PNG.
+    """
+    if intent == "mttr_month":
+        p = mttr_by_month()
+        if p.get("type") == "series":
+            png = series_png(p["x"], p["y"], p.get("title", ""), "Month", "MTTR (min)")
+        else:
+            raise HTTPException(400, "Not chartable")
+
+    elif intent == "tickets_month":
+        p = tickets_by_month()
+        if p.get("type") == "series":
+            png = series_png(p["x"], p["y"], p.get("title", ""), "Month", "Tickets")
+        else:
+            raise HTTPException(400, "Not chartable")
+
+    elif intent == "satisfaction_trend":
+        p = satisfaction_trend()
+        if p.get("type") == "series":
+            png = series_png(p["x"], p["y"], p.get("title", ""), "Month", "Avg Satisfaction")
+        else:
+            raise HTTPException(400, "Not chartable")
+
+    elif intent in ("status_dist", "top_locations", "mttr_by_asset",
+                     "satisfaction_by_priority", "satisfaction_by_asset"):
+        func = {
+            "status_dist":               status_distribution,
+            "top_locations":             top_locations,
+            "mttr_by_asset":             mttr_by_asset,
+            "satisfaction_by_priority":  satisfaction_by_priority,
+            "satisfaction_by_asset":     satisfaction_by_asset,
+        }[intent]
+        p = func()
+        if p.get("type") == "bar":
+            png = bar_png(p["labels"], p["values"], p.get("title", ""))
+        else:
+            raise HTTPException(400, "Not chartable")
+
+    else:
+        raise HTTPException(404, "Chart not available")
+
+    return Response(content=png, media_type="image/png")
