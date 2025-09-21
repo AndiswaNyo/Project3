@@ -148,8 +148,15 @@ def _prepare_sqlite() -> None:
 def _load_df() -> pd.DataFrame:
     if not DB_PATH.exists():
         _prepare_sqlite()
-    with sqlite3.connect(DB_PATH) as con:
-        d = pd.read_sql(f'SELECT * FROM "{TABLE}"', con)
+    try:
+        with sqlite3.connect(DB_PATH) as con:
+            d = pd.read_sql(f'SELECT * FROM "{TABLE}"', con)
+    except Exception:
+        # DB exists but table missing/corrupt → rebuild from Excel once
+        _prepare_sqlite()
+        with sqlite3.connect(DB_PATH) as con:
+            d = pd.read_sql(f'SELECT * FROM "{TABLE}"', con)
+
     if "created_on_norm" in d.columns:
         d["created_on_norm"] = pd.to_datetime(d["created_on_norm"], errors="coerce")
     d = _ensure_periods(d)
@@ -1708,3 +1715,4 @@ def _debug_routes():
         "has_eval_single": "/eval/nlu/single" in [r.path for r in app.routes],
         "has_eval_curve": "/eval/nlu/curve" in [r.path for r in app.routes],
     }
+
