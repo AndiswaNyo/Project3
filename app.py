@@ -625,21 +625,29 @@ load_registry(force=True)
 
 # ---- DB-defined KPI runner ----------------------------------------------
 def kpi_from_sql(name: str) -> Dict:
-    row = REGISTRY["defs"][name]
+    row = REGISTRY["defs"].get(name)    # <- use .get() instead of []
+    if not row:
+        return _err(f"Unknown SQL KPI '{name}'.")   # <- graceful error
+
     sql = row.get("sql", "")
     if not sql.strip():
-        return _err()
+        return _err(f"No SQL for KPI '{name}'.")
+
     with sqlite3.connect(DB_PATH) as con:
         df = pd.read_sql(sql, con)
+
     cols_lower = [c.lower() for c in df.columns]
     if "label" not in cols_lower or "value" not in cols_lower:
-        return _err()
+        return _err(f"SQL KPI '{name}' must return columns label,value.")
+
     label_col = df.columns[cols_lower.index("label")]
     value_col = df.columns[cols_lower.index("value")]
+
     labels = df[label_col].astype(str).tolist()
     values = pd.to_numeric(df[value_col], errors="coerce").fillna(0).astype(float).tolist()
     if not labels or not values:
-        return _err()
+        return _err(f"No data for SQL KPI '{name}'.")
+
     title = row.get("description") or name
     payload = {"type":"bar","title":title,"labels":labels,"values":values}
     if row.get("chart_hint") in ("bar","line","pie"):
@@ -1473,7 +1481,7 @@ def chat(inp: ChatIn, request: Request):
 
     # 2b) KPI action
     if action in {"get","show","analyze"} and name_kpi:
-        # ---- treat 'dashboard' as a special intent, not a KPI ----
+        # ---- SPECIAL: treat 'dashboard' as an intent, not a KPI ----
         if name_kpi == "dashboard":
             p, b, c = extract_period_by_chart(user_msg)
             if p not in {"week","biweekly","month","quarter"}:
@@ -1487,14 +1495,30 @@ def chat(inp: ChatIn, request: Request):
                 "intent": "dashboard",
                 "payload": {
                     "reply": f"Here’s the {p} dashboard view.",
-                    # choose one endpoint and use it everywhere; the PNG grid is /dashboard/chart
                     "url": f"{base}/dashboard/chart{qstr}"
                 },
                 "parsed": {"period": p, "by": b, "chart": c}
             })
-        # -----------------------------------------------------------
+        # ------------------------------------------------------------
 
-        d_payload = KPI_FUNCS[name_kpi](d, period=period, by=by) if name_kpi in KPI_FUNCS else kpi_from_sql(name_kpi)
+        # Known KPI?
+        known_builtin = name_kpi in KPI_FUNCS
+        known_sql     = name_kpi in REGISTRY["defs"]
+
+        if not (known_builtin or known_sql):
+            # return a clean error payload instead of raising 500
+            kpis = sorted(list(KPI_FUNCS.keys()) + list(REGISTRY["defs"].keys()))
+            return JSONResponse({
+                "intent": "error",
+                "payload": _err(
+                    f"Unknown KPI '{name_kpi}'. Try one of: {', '.join(kpis[:20])}" +
+                    (" …" if len(kpis) > 20 else "")
+                ),
+                "parsed": {"period": period, "by": by, "chart": chart}
+            })
+
+        # Compute payload safely
+        d_payload = KPI_FUNCS[name_kpi](d, period=period, by=by) if known_builtin else kpi_from_sql(name_kpi)
         chosen_chart, notice = _validate_chart_for(name_kpi, chart, d_payload, period)
         return JSONResponse({
             "intent": name_kpi,
@@ -1505,71 +1529,6 @@ def chat(inp: ChatIn, request: Request):
             "notice": notice,
             "parsed": {"period": period, "by": by, "chart": chart}
         })
-
-    # 2c) Deterministic fallback (no LLM)
-
-    tokens = re.findall(r"[a-z0-9_]+", user_msg.lower())
-    kpi_guess = resolve_kpi_name(tokens)
-    if kpi_guess == "dashboard":
-        # Extract period/by if user wrote "dashboard by location"
-        p, b, c = extract_period_by_chart(user_msg)
-
-        # default if period not valid
-        if p not in {"week","biweekly","month","quarter"}:
-            p = DEFAULT_DASHBOARD_PERIOD
-
-        qs = []
-        if p: qs.append(f"period={p}")
-        if b in {"priority","asset","location","assignee","status"}:
-            qs.append(f"by={b}")
-        qstr = ("?" + "&".join(qs)) if qs else ""
-
-        return JSONResponse({
-            "intent": "dashboard",
-            "payload": {
-                "reply": f"Here’s the {p} dashboard view.",
-                "url": f"{base}/dashboard/chart{qstr}"   # 👈 notice /dashboard/chart here
-            },
-            "parsed": {"period": p, "by": b, "chart": c}
-        })
-
-    if kpi_guess:
-        # Handle dashboard specially (it's not a KPI function or SQL KPI)
-        if kpi_guess == "dashboard":
-            p, b, c = extract_period_by_chart(user_msg)
-
-            if p not in {"week", "biweekly", "month", "quarter"}:
-                p = DEFAULT_DASHBOARD_PERIOD
-
-            qs = []
-            if p: qs.append(f"period={p}")
-            if b in {"priority", "asset", "location", "assignee", "status"}:
-                qs.append(f"by={b}")
-            qstr = ("?" + "&".join(qs)) if qs else ""
-
-            return JSONResponse({
-                "intent": "dashboard",
-                "payload": {
-                    "reply": f"Here’s the {p} dashboard view.",
-                    "url": f"{base}/dashboard/chart{qstr}"
-                },
-                "parsed": {"period": p, "by": b, "chart": c}
-            })
-
-        # Normal KPI route (built-ins or SQL-defined)
-        p, b, c = extract_period_by_chart(user_msg)
-        d_payload = KPI_FUNCS[kpi_guess](d, period=p, by=b) if kpi_guess in KPI_FUNCS else kpi_from_sql(kpi_guess)
-        chosen_chart, notice = _validate_chart_for(kpi_guess, c, d_payload, p)
-        return JSONResponse({
-            "intent": kpi_guess,
-            "payload": d_payload,
-            "period": p,
-            "by": b,
-            "chart": chosen_chart,
-            "notice": notice,
-            "parsed": {"period": p, "by": b, "chart": c}
-        })
-
 
     # 3) Last resort: greet only if the user explicitly gave a name; else small talk
     name = extract_name(user_msg)
