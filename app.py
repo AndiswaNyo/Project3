@@ -23,6 +23,9 @@ from pydantic import BaseModel, Field
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 
+# =============================== Configuration ============================
+DEFAULT_DASHBOARD_PERIOD = os.getenv("DEFAULT_DASHBOARD_PERIOD", "month")
+
 # --- LLM setup -------------------------------------------------------------
 from dotenv import load_dotenv, find_dotenv
 from openai import OpenAI
@@ -175,34 +178,79 @@ def _ensure_learning_tables() -> None:
     if not DB_PATH.exists():
         _prepare_sqlite()
     with sqlite3.connect(DB_PATH) as con:
-        con.execute("""CREATE TABLE IF NOT EXISTS kpi_definitions(
-            name TEXT PRIMARY KEY,
-            sql TEXT NOT NULL,
-            chart_hint TEXT,
-            description TEXT,
-            enabled INTEGER DEFAULT 1,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS kpi_synonyms(
-            term TEXT PRIMARY KEY,
-            kpi_name TEXT NOT NULL,
-            weight REAL DEFAULT 1.0
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS utterance_logs(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT,
-            parsed_json TEXT,
-            resolved_kpi TEXT,
-            success INTEGER,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )""")
-        con.execute("""CREATE TABLE IF NOT EXISTS feedback(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            utterance_id INTEGER,
-            label TEXT,
-            note TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )""")
+        # kpi_definitions
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS kpi_definitions(
+                name        TEXT PRIMARY KEY,
+                sql         TEXT NOT NULL,
+                chart_hint  TEXT,
+                description TEXT,
+                enabled     INTEGER DEFAULT 1,
+                updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # kpi_synonyms
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS kpi_synonyms(
+                term     TEXT PRIMARY KEY,
+                kpi_name TEXT NOT NULL,
+                weight   REAL DEFAULT 1.0
+            )
+        """)
+
+        # utterance_logs  ✅ replace the "..." with real columns
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS utterance_logs(
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                text         TEXT,
+                parsed_json  TEXT,
+                resolved_kpi TEXT,
+                success      INTEGER,
+                created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # feedback
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS feedback(
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                utterance_id INTEGER,
+                label        TEXT,
+                note         TEXT,
+                created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # --- Seed default synonyms if empty (Option 3) ---
+        row = con.execute("SELECT COUNT(*) FROM kpi_synonyms").fetchone()
+        if row and row[0] == 0:
+            default_synonyms = [
+                ("mean time to repair", "mttr", 1.0),
+                ("repair time", "mttr", 1.0),
+                ("time to repair", "mttr", 1.0),
+                ("downtime", "mttr", 1.0),
+
+                ("ticket count", "ticket_volume", 1.0),
+                ("number of tickets", "ticket_volume", 1.0),
+                ("workload", "ticket_volume", 1.0),
+
+                ("customer satisfaction", "satisfaction_avg", 1.0),
+                ("csat score", "satisfaction_avg", 1.0),
+                ("satisfaction", "satisfaction_avg", 1.0),
+
+                ("first time fix", "ftfr", 1.0),
+                ("first time fix rate", "ftfr", 1.0),
+                ("ftf", "ftfr", 1.0),
+
+                ("locations", "top_locations", 1.0),
+                ("sites", "top_locations", 1.0),
+                ("branches", "top_locations", 1.0),
+            ]
+            con.executemany(
+                "INSERT INTO kpi_synonyms(term, kpi_name, weight) VALUES (?, ?, ?)",
+                default_synonyms
+            )
         con.commit()
 
 def load_registry(force: bool=False) -> None:
@@ -217,32 +265,68 @@ def load_registry(force: bool=False) -> None:
 
 def resolve_kpi_name(tokens: List[str]) -> Optional[str]:
     names = set(REGISTRY["defs"].keys()) | set(REGISTRY["funcs"].keys()) | {"dashboard"}
-
+    
+    # Join tokens for phrase matching
+    full_text = " ".join(tokens).lower()
+    
     # 1) exact match
     for t in tokens:
         if t in names:
             return t
 
-    # 2) synonyms table
+    # 2) synonyms table (single tokens)
     for t in tokens:
         if t in REGISTRY["synonyms"]:
             return REGISTRY["synonyms"][t]
+    
+    # 2b) Check multi-word synonyms by joining tokens
+    if full_text in REGISTRY["synonyms"]:
+        return REGISTRY["synonyms"][full_text]
 
-    # 3) heuristics
-    if "mttr" in tokens:
+    # 3) Enhanced heuristics with phrase matching
+    mttr_indicators = [
+        "mttr" in tokens,
+        "repair" in tokens and "time" in tokens,
+        "downtime" in tokens,
+        "mean" in tokens and "repair" in tokens,
+        "fix" in tokens and "time" in tokens,
+        "resolution" in tokens and "time" in tokens
+    ]
+    if any(mttr_indicators):
         return "mttr"
-    if any(t in tokens for t in ("ticket", "tickets", "volume", "count", "loads")):
+        
+    if any(t in tokens for t in ("ticket", "tickets", "volume", "count", "loads", "workload", "number")):
         return "ticket_volume"
-    if any(t in tokens for t in ("csat", "satisfaction", "satisfied", "sat")):
+        
+    satisfaction_indicators = [
+        any(t in tokens for t in ("csat", "satisfaction", "satisfied", "sat", "customer")),
+        "score" in tokens and "satisfaction" in tokens
+    ]
+    if any(satisfaction_indicators):
         return "satisfaction_avg"
-    if "ftfr" in tokens or ("first" in tokens and "time" in tokens and "fix" in tokens):
+        
+    ftfr_indicators = [
+        "ftfr" in tokens,
+        "first" in tokens and "time" in tokens and "fix" in tokens,
+        "ftf" in tokens
+    ]
+    if any(ftfr_indicators):
         return "ftfr"
-    if "status" in tokens or "statuses" in tokens:
+        
+    if "status" in tokens or "statuses" in tokens or "ratio" in tokens:
         return "status_ratio"
-    if ("top" in tokens) and any(t in tokens for t in ("location", "locations", "site", "branch")):
+        
+    location_indicators = [
+        ("top" in tokens or "locations" in tokens or "sites" in tokens) and 
+        any(t in tokens for t in ("location", "locations", "site", "sites", "branch", "branches")),
+        "popular" in tokens and "location" in tokens
+    ]
+    if any(location_indicators):
         return "top_locations"
-    if "dashboard" in tokens:
+        
+    if "dashboard" in tokens or "overview" in tokens or "summary" in tokens:
         return "dashboard"
+        
     return None
 
 def log_utterance(text: str, parsed: dict, resolved_kpi: Optional[str], success: bool) -> None:
@@ -1191,26 +1275,28 @@ TOKEN_CHART   = {"bar", "line", "pie"}
 
 def extract_period_by_chart(text: str):
     m = (text or "").lower()
-    # period
+
+    # ---- period ----
     period = None
-    if re.search(r"\bbi[-\s]?weekly\b", m) or re.search(r"\bfortnight\b", m) or re.search(r"\b(?:2|two)\s*weeks?\b", m):
+    if (re.search(r"\bbi[-\s]?weekly\b", m) or
+        re.search(r"\bfortnight\b", m) or
+        re.search(r"\b(?:2|two)\s*weeks?\b", m)):
         period = "biweekly"
-    elif re.search(r"\bweek\b", m):
+    elif re.search(r"\bweek(ly)?\b", m):
         period = "week"
-    elif re.search(r"\bmonth\b", m):
+    elif re.search(r"\bmonth(ly)?\b", m):         # <-- catches "month" and "monthly"
         period = "month"
-    elif re.search(r"\bquarter\b", m):
+    elif re.search(r"\bquarter(ly)?\b", m):       # <-- catches "quarter" and "quarterly"
         period = "quarter"
 
-    # by
-    by = None
+    # ---- by ----  (leave your code as-is)
     m_by = re.search(r"\bby\s+(priority|asset|location|assignee|status)\b", m)
     if m_by:
         by = m_by.group(1)
     else:
         by = infer_by_field(m)
 
-    # chart
+    # ---- chart ---- (leave your code as-is)
     chart = None
     if re.search(r"\bline\b", m):
         chart = "line"
@@ -1345,14 +1431,69 @@ def chat(inp: ChatIn, request: Request):
 
     # 2a) Dashboard
     if action == "dashboard":
+        user_msg_lower = user_msg.lower()
+
+        # Map phrases to the 4 supported values
+        if "quarter" in user_msg_lower or "quarterly" in user_msg_lower:
+            period = "quarter"
+        elif ("biweekly" in user_msg_lower or "fortnight" in user_msg_lower or
+            "two weeks" in user_msg_lower or "2 weeks" in user_msg_lower):
+            period = "biweekly"
+        elif "week" in user_msg_lower or "weekly" in user_msg_lower:
+            period = "week"
+        elif "month" in user_msg_lower or "monthly" in user_msg_lower:
+            period = "month"
+        elif ("6 months" in user_msg_lower or "half year" in user_msg_lower or
+            "biannual" in user_msg_lower or "bi-annual" in user_msg_lower):
+            # Not supported by the backend; pick the closest supported bucket
+            period = "quarter"
+        elif "year" in user_msg_lower or "annual" in user_msg_lower or "yearly" in user_msg_lower:
+            # Not supported; pick a safe fallback
+            period = "quarter"
+        elif not period:
+            period = DEFAULT_DASHBOARD_PERIOD  # final fallback
+
+        # Build query string with only supported params
+        qs = []
+        if period in {"week", "biweekly", "month", "quarter"}:
+            qs.append(f"period={period}")
+        if by in {"priority", "asset", "location", "assignee", "status"}:
+            qs.append(f"by={by}")
+        # don't pass chart; dashboard tiles choose their own chart styles
+        qstr = ("?" + "&".join(qs)) if qs else ""
+
         return JSONResponse({
             "intent": "dashboard",
-            "payload": {"reply": "Here’s the dashboard view.", "url": f"{base}/dashboard"},
-            "parsed": {"period": period, "by": by, "chart": chart}
-        })
+            "payload": {
+                "reply": f"Here’s the {period} dashboard view.",
+                "url": f"{base}/dashboard/chart{qstr}"
+    },
+    "parsed": {"period": period, "by": by, "chart": chart}
+})
 
     # 2b) KPI action
     if action in {"get","show","analyze"} and name_kpi:
+        # ---- treat 'dashboard' as a special intent, not a KPI ----
+        if name_kpi == "dashboard":
+            p, b, c = extract_period_by_chart(user_msg)
+            if p not in {"week","biweekly","month","quarter"}:
+                p = DEFAULT_DASHBOARD_PERIOD
+            qs = []
+            if p: qs.append(f"period={p}")
+            if b in {"priority","asset","location","assignee","status"}:
+                qs.append(f"by={b}")
+            qstr = ("?" + "&".join(qs)) if qs else ""
+            return JSONResponse({
+                "intent": "dashboard",
+                "payload": {
+                    "reply": f"Here’s the {p} dashboard view.",
+                    # choose one endpoint and use it everywhere; the PNG grid is /dashboard/chart
+                    "url": f"{base}/dashboard/chart{qstr}"
+                },
+                "parsed": {"period": p, "by": b, "chart": c}
+            })
+        # -----------------------------------------------------------
+
         d_payload = KPI_FUNCS[name_kpi](d, period=period, by=by) if name_kpi in KPI_FUNCS else kpi_from_sql(name_kpi)
         chosen_chart, notice = _validate_chart_for(name_kpi, chart, d_payload, period)
         return JSONResponse({
@@ -1366,10 +1507,56 @@ def chat(inp: ChatIn, request: Request):
         })
 
     # 2c) Deterministic fallback (no LLM)
-    import re
+
     tokens = re.findall(r"[a-z0-9_]+", user_msg.lower())
     kpi_guess = resolve_kpi_name(tokens)
+    if kpi_guess == "dashboard":
+        # Extract period/by if user wrote "dashboard by location"
+        p, b, c = extract_period_by_chart(user_msg)
+
+        # default if period not valid
+        if p not in {"week","biweekly","month","quarter"}:
+            p = DEFAULT_DASHBOARD_PERIOD
+
+        qs = []
+        if p: qs.append(f"period={p}")
+        if b in {"priority","asset","location","assignee","status"}:
+            qs.append(f"by={b}")
+        qstr = ("?" + "&".join(qs)) if qs else ""
+
+        return JSONResponse({
+            "intent": "dashboard",
+            "payload": {
+                "reply": f"Here’s the {p} dashboard view.",
+                "url": f"{base}/dashboard/chart{qstr}"   # 👈 notice /dashboard/chart here
+            },
+            "parsed": {"period": p, "by": b, "chart": c}
+        })
+
     if kpi_guess:
+        # Handle dashboard specially (it's not a KPI function or SQL KPI)
+        if kpi_guess == "dashboard":
+            p, b, c = extract_period_by_chart(user_msg)
+
+            if p not in {"week", "biweekly", "month", "quarter"}:
+                p = DEFAULT_DASHBOARD_PERIOD
+
+            qs = []
+            if p: qs.append(f"period={p}")
+            if b in {"priority", "asset", "location", "assignee", "status"}:
+                qs.append(f"by={b}")
+            qstr = ("?" + "&".join(qs)) if qs else ""
+
+            return JSONResponse({
+                "intent": "dashboard",
+                "payload": {
+                    "reply": f"Here’s the {p} dashboard view.",
+                    "url": f"{base}/dashboard/chart{qstr}"
+                },
+                "parsed": {"period": p, "by": b, "chart": c}
+            })
+
+        # Normal KPI route (built-ins or SQL-defined)
         p, b, c = extract_period_by_chart(user_msg)
         d_payload = KPI_FUNCS[kpi_guess](d, period=p, by=b) if kpi_guess in KPI_FUNCS else kpi_from_sql(kpi_guess)
         chosen_chart, notice = _validate_chart_for(kpi_guess, c, d_payload, p)
@@ -1382,6 +1569,7 @@ def chat(inp: ChatIn, request: Request):
             "notice": notice,
             "parsed": {"period": p, "by": b, "chart": c}
         })
+
 
     # 3) Last resort: greet only if the user explicitly gave a name; else small talk
     name = extract_name(user_msg)
@@ -1715,4 +1903,3 @@ def _debug_routes():
         "has_eval_single": "/eval/nlu/single" in [r.path for r in app.routes],
         "has_eval_curve": "/eval/nlu/curve" in [r.path for r in app.routes],
     }
-
